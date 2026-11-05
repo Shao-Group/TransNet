@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transnet"
+version = "1.0.0"
+description = "Neural scoring of candidate transcripts from RNA-seq splice graphs"
+readme = "README.md"
+requires-python = ">=3.12"
+# Dependencies are installed by environment.yml (PyTorch, PyG, samtools, compilers).
+
+[project.scripts]
+transnet = "transnet.cli:main"
+
+[tool.setuptools]
+packages = ["transnet"]
+
+[tool.setuptools.package-data]
+transnet = ["pretrained/*.pt"]

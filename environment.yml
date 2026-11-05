@@ -1,0 +1,19 @@
+# TransNet runtime + exporter build environment.
+# Versions are those used to train and verify the published models.
+name: transnet
+channels: [conda-forge, bioconda, nodefaults]
+dependencies:
+  - python=3.12
+  - pytorch=2.12.0
+  - pytorch_geometric=2.8.1
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib-base
+  - samtools=1.24
+  # exporter build (C++17, htslib, Boost headers)
+  - cxx-compiler
+  - make
+  - htslib=1.24
+  - libboost-devel
+  - pip

@@ -1,0 +1,1624 @@
+/*
+Part of Scallop Transcript Assembler
+(c) 2017 by  Mingfu Shao, Carl Kingsford, and Carnegie Mellon University.
+Part of Scallop2
+(c) 2021 by  Qimin Zhang, Mingfu Shao, and The Pennsylvania State University.
+See LICENSE for licensing.
+*/
+
+#include <cassert>
+#include <cstdio>
+#include <map>
+#include <iomanip>
+#include <fstream>
+
+#include "bundle.h"
+#include "bundle_bridge.h"
+#include "region.h"
+#include "config.h"
+#include "util.h"
+#include "undirected_graph.h"
+
+static void merge_intervals(vector<PI32> &v)
+{
+	sort(v.begin(), v.end());
+	int n = 0;
+	for(int i = 0; i < v.size(); i++)
+	{
+		if(v[i].first >= v[i].second) continue;
+		if(n >= 1 && v[i].first <= v[n - 1].second)
+		{
+			if(v[i].second > v[n - 1].second) v[n - 1].second = v[i].second;
+		}
+		else
+		{
+			v[n++] = v[i];
+		}
+	}
+	v.resize(n);
+}
+
+static int interval_overlap_length(const split_interval_map &m, int32_t l, int32_t r)
+{
+	int length = 0;
+	for(SIMI it = m.begin(); it != m.end(); it++)
+	{
+		int32_t p = lower(it->first);
+		int32_t q = upper(it->first);
+		if(q <= l) continue;
+		if(p >= r) break;
+		length += min(q, r) - max(p, l);
+	}
+	return length;
+}
+
+bundle::bundle(bundle_base &b, const vector<transcript> &assigned)
+	: bb(b), br(b), assigned_transcripts(assigned)
+{
+	for(int i = 0; i < assigned_transcripts.size(); i++)
+	{
+		PI32 p = assigned_transcripts[i].get_bounds();
+		if(p.first < bb.lpos) bb.lpos = p.first;
+		if(p.second > bb.rpos) bb.rpos = p.second;
+	}
+	br.ref_trsts = assigned_transcripts;
+	br.build();
+	prepare();
+}
+
+bundle::~bundle()
+{}
+
+int bundle::prepare()
+{
+	compute_strand();
+	build_intervals();
+	add_assigned_transcript_intervals();
+	build_junctions();
+	add_assigned_transcript_junctions();
+	build_regions();
+	build_partial_exons();
+
+	build_partial_exon_map();
+	link_partial_exons();
+	return 0;
+}
+
+int bundle::build(int mode, bool revise)
+{
+	build_splice_graph(mode);
+	if(revise == true) revise_splice_graph();
+	if(ensure_assigned_transcript_paths() != 0) return 1;
+	build_hyper_set();
+	return 0;
+}
+
+int bundle::compute_strand()
+{
+	if(library_type != UNSTRANDED) assert(bb.strand != '.');
+	if(library_type != UNSTRANDED) return 0;
+
+	int n0 = 0, np = 0, nq = 0;
+	for(int i = 0; i < bb.hits.size(); i++)
+	{
+		if(bb.hits[i].xs == '.') n0++;
+		if(bb.hits[i].xs == '+') np++;
+		if(bb.hits[i].xs == '-') nq++;
+	}
+
+	if(np > nq) bb.strand = '+';
+	else if(np < nq) bb.strand = '-';
+	else bb.strand = '.';
+
+	return 0;
+}
+
+int bundle::build_intervals()
+{
+	fmap.clear();
+	for(int i = 0; i < br.fragments.size(); i++)
+	{
+		fragment &fr = br.fragments[i];
+		if(fr.paths.size() != 1 || fr.paths[0].type != 1) continue;
+		vector<int32_t> vv = br.get_aligned_intervals(fr);
+		if(vv.size() <= 0) continue;
+		assert(vv.size() % 2 == 0);
+
+		for(int k = 0; k < vv.size() / 2; k++)
+		{
+			int32_t p = vv[2 * k + 0];
+			int32_t q = vv[2 * k + 1];
+			fmap += make_pair(ROI(p, q), 1);
+		}
+	}
+
+	for(int i = 0; i < bb.hits.size(); i++)
+	{
+		hit &ht = bb.hits[i];
+		if(ht.bridged == true) continue;
+		if((ht.flag & 0x100) >= 1) continue;
+		if(br.breads.find(ht.qname) != br.breads.end()) continue;
+		for(int k = 0; k < ht.itvm.size(); k++)
+		{
+			int32_t s = high32(ht.itvm[k]);
+			int32_t t = low32(ht.itvm[k]);
+			fmap += make_pair(ROI(s, t), 1);
+		}
+	}
+	return 0;
+}
+
+int bundle::add_assigned_transcript_intervals()
+{
+	newly_added_intervals.clear();
+
+	vector<PI32> assigned;
+	vector<int32_t> partition_points;
+	for(int i = 0; i < assigned_transcripts.size(); i++)
+	{
+		const transcript &t = assigned_transcripts[i];
+		for(int k = 0; k < t.exons.size(); k++)
+		{
+			assigned.push_back(t.exons[k]);
+			partition_points.push_back(t.exons[k].first);
+			partition_points.push_back(t.exons[k].second);
+		}
+	}
+	merge_intervals(assigned);
+
+	vector<PI32> covered;
+	for(SIMI it = fmap.begin(); it != fmap.end(); it++)
+		covered.push_back(PI32(lower(it->first), upper(it->first)));
+	merge_intervals(covered);
+
+	vector<PI32> missing;
+	int j = 0;
+	for(int i = 0; i < assigned.size(); i++)
+	{
+		int32_t p = assigned[i].first;
+		int32_t q = assigned[i].second;
+		while(j < covered.size() && covered[j].second <= p) j++;
+		int k = j;
+		while(k < covered.size() && covered[k].first < q)
+		{
+			if(covered[k].first > p)
+				missing.push_back(PI32(p, min(q, covered[k].first)));
+			if(covered[k].second > p) p = covered[k].second;
+			if(p >= q) break;
+			k++;
+		}
+		if(p < q) missing.push_back(PI32(p, q));
+	}
+
+	for(int i = 0; i < missing.size(); i++)
+	{
+		ROI x(missing[i].first, missing[i].second);
+		fmap += make_pair(x, 1);
+		newly_added_intervals += make_pair(x, 1);
+	}
+
+	// Region construction expects fmap intervals not to cross transcript,
+	// splice, or bundle partition coordinates. Splitting changes no coverage.
+	sort(partition_points.begin(), partition_points.end());
+	partition_points.erase(unique(partition_points.begin(), partition_points.end()), partition_points.end());
+	for(int i = 0; i < partition_points.size(); i++) create_split(fmap, partition_points[i]);
+	return 0;
+}
+
+int bundle::build_junctions()
+{
+	map<int64_t, vector<hit*>> m;		// bridged fragments
+	for(int i = 0; i < br.fragments.size(); i++)
+	{
+		fragment &fr = br.fragments[i];
+		if(fr.paths.size() != 1 || fr.paths[0].type != 1) continue;
+		vector<int32_t> vv = br.get_splices(fr);
+		if(vv.size() <= 0) continue;
+		assert(vv.size() % 2 == 0);
+
+		for(int k = 0; k < vv.size() / 2; k++)
+		{
+			int64_t p = pack(vv[2 * k + 0], vv[2 * k + 1]);
+
+			if(m.find(p) == m.end())
+			{
+				vector<hit*> hv;
+				hv.push_back(fr.h1);
+				//hv.push_back(fr.h2);
+				m.insert(pair< int64_t, vector<hit*> >(p, hv));
+			}
+			else
+			{
+				m[p].push_back(fr.h1);
+				//m[p].push_back(fr.h2);
+			}
+		}
+	}
+
+	for(int i = 0; i < bb.hits.size(); i++)
+	{
+		if(bb.hits[i].bridged == true) continue;
+		if((bb.hits[i].flag & 0x100) >= 1) continue;
+		if(br.breads.find(bb.hits[i].qname) != br.breads.end()) continue;
+
+		vector<int64_t> v = bb.hits[i].spos;
+		if(v.size() == 0) continue;
+
+		for(int k = 0; k < v.size(); k++)
+		{
+			int64_t p = v[k];
+			if(m.find(p) == m.end())
+			{
+				vector<hit*> hv;
+				hv.push_back(&(bb.hits[i]));
+				m.insert(pair< int64_t, vector<hit*> >(p, hv));
+			}
+			else
+			{
+				m[p].push_back(&(bb.hits[i]));
+			}
+		}
+	}
+
+	map<int64_t, vector<hit*>>::iterator it;
+	for(it = m.begin(); it != m.end(); it++)
+	{
+		vector<hit*> &v = it->second;
+		if(v.size() < min_splice_boundary_hits) continue;
+
+		int32_t p1 = high32(it->first);
+		int32_t p2 = low32(it->first);
+
+		int s0 = 0;
+		int s1 = 0;
+		int s2 = 0;
+		int nm = 0;
+		for(int k = 0; k < v.size(); k++)
+		{
+			nm += v[k]->nm;
+			if(v[k]->xs == '.') s0++;
+			if(v[k]->xs == '+') s1++;
+			if(v[k]->xs == '-') s2++;
+		}
+
+		//printf("junction: %s:%d-%d (%d, %d, %d) %d\n", bb.chrm.c_str(), p1, p2, s0, s1, s2, s1 < s2 ? s1 : s2);
+
+		junction jc(it->first, v.size());
+		jc.nm = nm;
+		if(s1 == 0 && s2 == 0) jc.strand = '.';
+		else if(s1 >= 1 && s2 >= 1) jc.strand = '.';
+		else if(s1 > s2) jc.strand = '+';
+		else jc.strand = '-';
+		junctions.push_back(jc);
+	}
+	return 0;
+}
+
+int bundle::add_assigned_transcript_junctions()
+{
+	set<int64_t> existing;
+	for(int i = 0; i < junctions.size(); i++)
+	{
+		existing.insert(pack(junctions[i].lpos, junctions[i].rpos));
+	}
+
+	for(int i = 0; i < assigned_transcripts.size(); i++)
+	{
+		const transcript &t = assigned_transcripts[i];
+		vector<PI32> v = t.get_intron_chain();
+		for(int k = 0; k < v.size(); k++)
+		{
+			int64_t p = pack(v[k].first, v[k].second);
+			if(existing.find(p) != existing.end()) continue;
+			junction jc(p, 1);
+			jc.strand = t.strand;
+			junctions.push_back(jc);
+			existing.insert(p);
+		}
+	}
+
+	sort(junctions.begin(), junctions.end(), [](const junction &x, const junction &y)
+	{
+		if(x.lpos != y.lpos) return x.lpos < y.lpos;
+		return x.rpos < y.rpos;
+	});
+	return 0;
+}
+
+int bundle::build_regions()
+{
+	MPI s;
+	s.insert(PI(bb.lpos, START_BOUNDARY));
+	s.insert(PI(bb.rpos, END_BOUNDARY));
+	for(int i = 0; i < junctions.size(); i++)
+	{
+		junction &jc = junctions[i];
+
+		//double ave, dev, max;
+		//evaluate_rectangle(fmap, jc.lpos, jc.rpos, ave, dev, max);
+
+		int32_t l = jc.lpos;
+		int32_t r = jc.rpos;
+
+		if(s.find(l) == s.end()) s.insert(PI(l, LEFT_SPLICE));
+		else if(s[l] == RIGHT_SPLICE) s[l] = LEFT_RIGHT_SPLICE;
+
+		if(s.find(r) == s.end()) s.insert(PI(r, RIGHT_SPLICE));
+		else if(s[r] == LEFT_SPLICE) s[r] = LEFT_RIGHT_SPLICE;
+	}
+	for(int i = 0; i < assigned_transcripts.size(); i++)
+	{
+		PI32 p = assigned_transcripts[i].get_bounds();
+		if(s.find(p.first) == s.end()) s.insert(PI(p.first, START_BOUNDARY));
+		if(s.find(p.second) == s.end()) s.insert(PI(p.second, END_BOUNDARY));
+	}
+
+	/*
+	for(int i = 0; i < pexons.size(); i++)
+	{
+		partial_exon &p = pexons[i];
+		if(s.find(p.lpos) != s.end()) s.insert(PI(p.lpos, p.ltype));
+		if(s.find(p.rpos) != s.end()) s.insert(PI(p.rpos, p.rtype));
+	}
+	*/
+
+	vector<PPI> v(s.begin(), s.end());
+	sort(v.begin(), v.end());
+
+	regions.clear();
+	for(int k = 0; k < v.size() - 1; k++)
+	{
+		int32_t l = v[k].first;
+		int32_t r = v[k + 1].first;
+		int ltype = v[k].second; 
+		int rtype = v[k + 1].second; 
+
+		if(ltype == LEFT_RIGHT_SPLICE) ltype = RIGHT_SPLICE;
+		if(rtype == LEFT_RIGHT_SPLICE) rtype = LEFT_SPLICE;
+
+		regions.push_back(region(l, r, ltype, rtype, &fmap, &(bb.imap)));
+	}
+	return 0;
+}
+
+int bundle::build_partial_exons()
+{
+	pexons.clear();
+	regional.clear();
+	for(int i = 0; i < regions.size(); i++)
+	{
+		region &r = regions[i];
+		for(int k = 0; k < r.pexons.size(); k++)
+		{
+			partial_exon &pe = r.pexons[k];
+			pe.rid = i;
+			pe.pid = pexons.size();
+			pe.newly_added_length = interval_overlap_length(newly_added_intervals, pe.lpos, pe.rpos);
+			pexons.push_back(pe);
+			if((pe.lpos != bb.lpos || pe.rpos != bb.rpos) && pe.ltype == START_BOUNDARY && pe.rtype == END_BOUNDARY) regional.push_back(true);
+			else regional.push_back(false);
+		}
+	}
+	return 0;
+}
+
+int bundle::build_partial_exon_map()
+{
+	pmap.clear();
+	for(int i = 0; i < pexons.size(); i++)
+	{
+		partial_exon &p = pexons[i];
+		pmap += make_pair(ROI(p.lpos, p.rpos), i + 1);
+	}
+	return 0;
+}
+
+int bundle::locate_left_partial_exon(int32_t x)
+{
+	SIMI it = pmap.find(ROI(x, x + 1));
+	if(it == pmap.end()) return -1;
+	assert(it->second >= 1);
+	assert(it->second <= pexons.size());
+
+	int k = it->second - 1;
+	int32_t p1 = lower(it->first);
+	int32_t p2 = upper(it->first);
+	assert(p2 >= x);
+	assert(p1 <= x);
+
+	if(x - p1 > min_flank_length && p2 - x < min_flank_length) k++;
+
+	if(k >= pexons.size()) return -1;
+	return k;
+}
+
+int bundle::locate_right_partial_exon(int32_t x)
+{
+	SIMI it = pmap.find(ROI(x - 1, x));
+	if(it == pmap.end()) return -1;
+	assert(it->second >= 1);
+	assert(it->second <= pexons.size());
+
+	int k = it->second - 1;
+	int32_t p1 = lower(it->first);
+	int32_t p2 = upper(it->first);
+	assert(p1 < x);
+	assert(p2 >= x);
+
+	if(p2 - x > min_flank_length && x - p1 <= min_flank_length) k--;
+	return k;
+}
+
+vector<int> bundle::align_hit(hit &h)
+{
+	bool b = true;
+	vector<int> sp2;
+	vector<int64_t> v;
+	h.get_aligned_intervals(v);
+	if(v.size() == 0) return sp2;
+
+	for(int k = 0; k < v.size(); k++)
+	{
+		int32_t p1 = high32(v[k]);
+		int32_t p2 = low32(v[k]);
+
+		int k1 = locate_left_partial_exon(p1);
+		int k2 = locate_right_partial_exon(p2);
+		if(k1 < 0 || k2 < 0) b = false;
+		if(b == false) break;
+
+		for(int j = k1; j <= k2; j++) sp2.push_back(j);
+	}
+
+	vector<int> e;
+	if(b == false) return e;
+	else return sp2;
+}
+
+vector<int> bundle::align_fragment(fragment &fr)
+{
+	bool b = true;
+	vector<int> sp2;
+	//if(fr.paths.size() != 1 || fr.paths[0].type != 1) return sp2;
+	vector<int32_t> v = br.get_aligned_intervals(fr);
+	assert(v.size() % 2 == 0);
+	if(v.size() == 0) return sp2;
+
+	for(int k = 0; k < v.size() / 2; k++)
+	{
+		int32_t p1 = v[2 * k + 0];
+		int32_t p2 = v[2 * k + 1];
+		int k1 = locate_left_partial_exon(p1);
+		int k2 = locate_right_partial_exon(p2);
+		if(k1 < 0 || k2 < 0) b = false;
+		if(b == false) break;
+		for(int j = k1; j <= k2; j++) sp2.push_back(j);
+	}
+
+	vector<int> e;
+	if(b == false) return e;
+	else return sp2;
+}
+
+int bundle::link_partial_exons()
+{
+	if(pexons.size() == 0) return 0;
+
+	MPI lm;
+	MPI rm;
+	for(int i = 0; i < pexons.size(); i++)
+	{
+		int32_t l = pexons[i].lpos;
+		int32_t r = pexons[i].rpos;
+
+		assert(lm.find(l) == lm.end());
+		assert(rm.find(r) == rm.end());
+		lm.insert(PPI(l, i));
+		rm.insert(PPI(r, i));
+	}
+
+	for(int i = 0; i < junctions.size(); i++)
+	{
+		junction &b = junctions[i];
+		MPI::iterator li = rm.find(b.lpos);
+		MPI::iterator ri = lm.find(b.rpos);
+
+		assert(li != rm.end());
+		assert(ri != lm.end());
+
+		if(li != rm.end() && ri != lm.end())
+		{
+			b.lexon = li->second;
+			b.rexon = ri->second;
+		}
+		else
+		{
+			b.lexon = b.rexon = -1;
+		}
+	}
+	return 0;
+}
+
+static bool build_transcript_vertex_path(const vector<partial_exon> &pexons,
+		const transcript &t, vector<int> &path)
+{
+	path.clear();
+	int k = 0;
+	for(int i = 0; i < t.exons.size(); i++)
+	{
+		int32_t p = t.exons[i].first;
+		int32_t q = t.exons[i].second;
+		if(p >= q) return false;
+
+		while(k < pexons.size() && pexons[k].rpos <= p) k++;
+		while(p < q)
+		{
+			if(k >= pexons.size()) return false;
+			if(pexons[k].lpos != p || pexons[k].rpos > q) return false;
+			path.push_back(k + 1);
+			p = pexons[k].rpos;
+			k++;
+		}
+	}
+	return path.size() >= 1;
+}
+
+bool bundle::has_transcript_path(const transcript &t)
+{
+	vector<int> path;
+	if(build_transcript_vertex_path(pexons, t, path) == false) return false;
+	if(gr.edge(0, path.front()).second == false) return false;
+	for(int i = 0; i < path.size(); i++)
+	{
+		if(gr.get_vertex_info(path[i]).type == EMPTY_VERTEX) return false;
+		if(i >= 1 && gr.edge(path[i - 1], path[i]).second == false) return false;
+	}
+	if(gr.edge(path.back(), gr.num_vertices() - 1).second == false) return false;
+	return true;
+}
+
+bool bundle::get_transcript_path(const transcript &t, vector<int> &path) const
+{
+	return build_transcript_vertex_path(pexons, t, path);
+}
+
+int bundle::ensure_assigned_transcript_paths()
+{
+	for(int i = 0; i < assigned_transcripts.size(); i++)
+	{
+		const transcript &t = assigned_transcripts[i];
+		vector<int> path;
+		if(build_transcript_vertex_path(pexons, t, path) == false)
+		{
+			printf("error: cannot map assigned transcript %s to bundle partial exons.\n",
+					t.transcript_id.c_str());
+			return 1;
+		}
+
+		for(int k = 0; k < path.size(); k++)
+		{
+			int v = path[k];
+			vertex_info vi = gr.get_vertex_info(v);
+			if(vi.type == EMPTY_VERTEX)
+			{
+				vi.type = 0;
+				gr.set_vertex_info(v, vi);
+			}
+			if(gr.get_vertex_weight(v) < min_guaranteed_edge_weight)
+				gr.set_vertex_weight(v, min_guaranteed_edge_weight);
+		}
+
+		vector<PI> edges;
+		edges.push_back(PI(0, path.front()));
+		for(int k = 1; k < path.size(); k++) edges.push_back(PI(path[k - 1], path[k]));
+		edges.push_back(PI(path.back(), gr.num_vertices() - 1));
+
+		for(int k = 0; k < edges.size(); k++)
+		{
+			int s = edges[k].first;
+			int z = edges[k].second;
+			if(gr.edge(s, z).second == true) continue;
+			edge_descriptor e = gr.add_edge(s, z);
+			gr.set_edge_weight(e, min_guaranteed_edge_weight);
+			edge_info ei;
+			ei.weight = min_guaranteed_edge_weight;
+			ei.strand = t.strand;
+			gr.set_edge_info(e, ei);
+		}
+
+		if(has_transcript_path(t) == false)
+		{
+			printf("error: assigned transcript %s is not a source-to-sink graph path.\n",
+					t.transcript_id.c_str());
+			return 1;
+		}
+	}
+	return 0;
+}
+
+int bundle::build_splice_graph(int mode)
+{
+	gr.clear();
+
+	// vertices: start, each region, end
+	gr.add_vertex();
+	vertex_info vi0;
+	vi0.lpos = bb.lpos;
+	vi0.rpos = bb.lpos;
+	gr.set_vertex_weight(0, 0);
+	gr.set_vertex_info(0, vi0);
+	for(int i = 0; i < pexons.size(); i++)
+	{
+		const partial_exon &r = pexons[i];
+		int length = r.rpos - r.lpos;
+		assert(length >= 1);
+		gr.add_vertex();
+		if(mode == 1) gr.set_vertex_weight(i + 1, r.max < min_guaranteed_edge_weight ? min_guaranteed_edge_weight : r.max);
+		if(mode == 2) gr.set_vertex_weight(i + 1, r.ave < min_guaranteed_edge_weight ? min_guaranteed_edge_weight : r.ave);
+		vertex_info vi;
+		vi.lpos = r.lpos;
+		vi.rpos = r.rpos;
+		vi.length = length;
+		vi.newly_added_length = r.newly_added_length;
+		vi.stddev = r.dev;
+		vi.regional = regional[i];
+		vi.type = pexons[i].type;
+		gr.set_vertex_info(i + 1, vi);
+	}
+
+	gr.add_vertex();
+	vertex_info vin;
+	vin.lpos = bb.rpos;
+	vin.rpos = bb.rpos;
+	gr.set_vertex_weight(pexons.size() + 1, 0);
+	gr.set_vertex_info(pexons.size() + 1, vin);
+
+	// edges: each junction => and e2w
+	for(int i = 0; i < junctions.size(); i++)
+	{
+		const junction &b = junctions[i];
+
+		if(b.lexon < 0 || b.rexon < 0) continue;
+
+		const partial_exon &x = pexons[b.lexon];
+		const partial_exon &y = pexons[b.rexon];
+
+		edge_descriptor p = gr.add_edge(b.lexon + 1, b.rexon + 1);
+		assert(b.count >= 1);
+		edge_info ei;
+		ei.weight = b.count;
+		ei.strand = b.strand;
+		gr.set_edge_info(p, ei);
+		gr.set_edge_weight(p, b.count);
+	}
+
+	// edges: connecting start/end and pexons
+	int ss = 0;
+	int tt = pexons.size() + 1;
+	for(int i = 0; i < pexons.size(); i++)
+	{
+		const partial_exon &r = pexons[i];
+
+		if(r.ltype == START_BOUNDARY)
+		{
+			edge_descriptor p = gr.add_edge(ss, i + 1);
+			double w = min_guaranteed_edge_weight;
+			if(mode == 1) w = r.max;
+			if(mode == 2) w = r.ave;
+			if(mode == 1 && i >= 1 && pexons[i - 1].rpos == r.lpos) w -= pexons[i - 1].max;
+			if(mode == 2 && i >= 1 && pexons[i - 1].rpos == r.lpos) w -= pexons[i - 1].ave;
+			if(w < min_guaranteed_edge_weight) w = min_guaranteed_edge_weight;
+			gr.set_edge_weight(p, w);
+			edge_info ei;
+			ei.weight = w;
+			gr.set_edge_info(p, ei);
+		}
+
+		if(r.rtype == END_BOUNDARY) 
+		{
+			edge_descriptor p = gr.add_edge(i + 1, tt);
+			double w = min_guaranteed_edge_weight;
+			if(mode == 1) w = r.max;
+			if(mode == 2) w = r.ave;
+			if(mode == 1 && i < pexons.size() - 1 && pexons[i + 1].lpos == r.rpos) w -= pexons[i + 1].max;
+			if(mode == 2 && i < pexons.size() - 1 && pexons[i + 1].lpos == r.rpos) w -= pexons[i + 1].ave;
+			if(w < min_guaranteed_edge_weight) w = min_guaranteed_edge_weight;
+			gr.set_edge_weight(p, w);
+			edge_info ei;
+			ei.weight = w;
+			gr.set_edge_info(p, ei);
+		}
+	}
+
+	// edges: connecting adjacent pexons => e2w
+	for(int i = 0; i < (int)(pexons.size()) - 1; i++)
+	{
+		const partial_exon &x = pexons[i];
+		const partial_exon &y = pexons[i + 1];
+
+		if(x.rpos != y.lpos) continue;
+
+		assert(x.rpos == y.lpos);
+		
+		int xd = gr.out_degree(i + 1);
+		int yd = gr.in_degree(i + 2);
+		double wt = min_guaranteed_edge_weight;
+		if(mode == 1) wt = (xd < yd) ? x.max: y.max;
+		if(mode == 2) wt = (xd < yd) ? x.ave: y.ave;
+		//int32_t xr = compute_overlap(mmap, x.rpos - 1);
+		//int32_t yl = compute_overlap(mmap, y.lpos);
+		//double wt = xr < yl ? xr : yl;
+
+		edge_descriptor p = gr.add_edge(i + 1, i + 2);
+		double w = (wt < min_guaranteed_edge_weight) ? min_guaranteed_edge_weight : wt;
+		gr.set_edge_weight(p, w);
+		edge_info ei;
+		ei.weight = w;
+		gr.set_edge_info(p, ei);
+	}
+
+	gr.strand = bb.strand;
+	gr.chrm = bb.chrm;
+	return 0;
+}
+
+int bundle::revise_splice_graph()
+{
+	bool b = false;
+	while(true)
+	{
+		b = tackle_false_boundaries();
+		if(b == true) continue;
+
+		b = remove_false_boundaries();
+		if(b == true) continue;
+
+		b = remove_inner_boundaries();
+		if(b == true) continue;
+
+		b = remove_small_exons();
+		if(b == true) continue;
+
+		b = remove_intron_contamination();
+		if(b == true) continue;
+
+		b = remove_small_junctions();
+		if(b == true) refine_splice_graph();
+		if(b == true) continue;
+
+		b = extend_start_boundaries();
+		if(b == true) continue;
+
+		b = extend_end_boundaries();
+		if(b == true) continue;
+
+		b = extend_boundaries();
+		if(b == true) refine_splice_graph();
+		if(b == true) continue;
+
+		b = keep_surviving_edges();
+		if(b == true) refine_splice_graph();
+		if(b == true) continue;
+
+		break;
+	}
+
+	//find_contamination_chain();
+	refine_splice_graph();
+
+	return 0;
+}
+
+int bundle::refine_splice_graph()
+{
+	while(true)
+	{
+		bool b = false;
+		for(int i = 1; i < gr.num_vertices() - 1; i++)
+		{
+			if(gr.degree(i) == 0) continue;
+			if(gr.in_degree(i) >= 1 && gr.out_degree(i) >= 1) continue;
+			gr.clear_vertex(i);
+			b = true;
+		}
+		if(b == false) break;
+	}
+	return 0;
+}
+
+bool bundle::extend_start_boundaries()
+{
+	bool flag = false;
+	for(int i = 1; i < gr.num_vertices() - 1; i++)
+	{
+		PEB p = gr.edge(0, i);
+		if(p.second == true) continue;
+
+		double wv = gr.get_vertex_weight(i);
+		double we = 0;
+		PEEI pei = gr.in_edges(i);
+		for(edge_iterator it = pei.first; it != pei.second; it++)
+		{
+			we += gr.get_edge_weight(*it);
+		}
+
+		if(wv < we || wv < 10 * we * we + 10) continue;
+
+		edge_descriptor ee = gr.add_edge(0, i);
+		gr.set_edge_weight(ee, wv - we);
+		gr.set_edge_info(ee, edge_info());
+
+		vertex_info vi = gr.get_vertex_info(i);
+		if(verbose >= 2) printf("extend start boundary: vertex = %d, wv = %.2lf, we = %.2lf, pos = %d\n", i, wv, we, vi.lpos);
+
+		flag = true;
+	}
+	return flag;
+}
+
+bool bundle::extend_end_boundaries()
+{
+	bool flag = false;
+	for(int i = 1; i < gr.num_vertices() - 1; i++)
+	{
+		PEB p = gr.edge(i, gr.num_vertices() - 1);
+		if(p.second == true) continue;
+
+		double wv = gr.get_vertex_weight(i);
+		double we = 0;
+		PEEI pei = gr.out_edges(i);
+		for(edge_iterator it = pei.first; it != pei.second; it++)
+		{
+			we += gr.get_edge_weight(*it);
+		}
+
+		if(wv < we || wv < 10 * we * we + 10) continue;
+
+		edge_descriptor ee = gr.add_edge(i, gr.num_vertices() - 1);
+		gr.set_edge_weight(ee, wv - we);
+		gr.set_edge_info(ee, edge_info());
+
+		vertex_info vi = gr.get_vertex_info(i);
+		if(verbose >= 2) printf("extend end boundary: vertex = %d, wv = %.2lf, we = %.2lf, pos = %d\n", i, wv, we, vi.rpos);
+
+		flag = true;
+	}
+	return flag;
+}
+
+bool bundle::extend_boundaries()
+{
+	edge_iterator it1, it2;
+	PEEI pei;
+	for(pei = gr.edges(), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+	{
+		edge_descriptor e = (*it1);
+		int s = e->source();
+		int t = e->target();
+		int32_t p = gr.get_vertex_info(t).lpos - gr.get_vertex_info(s).rpos;
+		double we = gr.get_edge_weight(e);
+		double ws = gr.get_vertex_weight(s);
+		double wt = gr.get_vertex_weight(t);
+
+		if(p <= 0) continue;
+		if(s == 0) continue;
+		if(t == gr.num_vertices() - 1) continue;
+
+		bool b = false;
+		if(gr.out_degree(s) == 1 && ws >= 10.0 * we * we + 10.0) b = true;
+		if(gr.in_degree(t) == 1 && wt >= 10.0 * we * we + 10.0) b = true;
+
+		if(b == false) continue;
+
+		if(gr.out_degree(s) == 1)
+		{
+			edge_descriptor ee = gr.add_edge(s, gr.num_vertices() - 1);
+			gr.set_edge_weight(ee, ws);
+			gr.set_edge_info(ee, edge_info());
+		}
+		if(gr.in_degree(t) == 1)
+		{
+			edge_descriptor ee = gr.add_edge(0, t);
+			gr.set_edge_weight(ee, wt);
+			gr.set_edge_info(ee, edge_info());
+		}
+		gr.remove_edge(e);
+
+		if(verbose >= 2) printf("extend boundary: s = %d, t = %d, ws = %.1lf, we = %.1lf\n", s, t, ws, we);
+		return true;
+	}
+
+	return false;
+}
+
+VE bundle::compute_maximal_edges()
+{
+	typedef pair<double, edge_descriptor> PDE;
+	vector<PDE> ve;
+
+	undirected_graph ug;
+	edge_iterator it1, it2;
+	PEEI pei;
+	for(int i = 0; i < gr.num_vertices(); i++) ug.add_vertex();
+	for(pei = gr.edges(), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+	{
+		edge_descriptor e = (*it1);
+		double w = gr.get_edge_weight(e);
+		int s = e->source();
+		int t = e->target();
+		if(s == 0) continue;
+		if(t == gr.num_vertices() - 1) continue;
+		ug.add_edge(s, t);
+		ve.push_back(PDE(w, e));
+	}
+
+	vector<int> vv = ug.assign_connected_components();
+
+	sort(ve.begin(), ve.end());
+
+	for(int i = 1; i < ve.size(); i++) assert(ve[i - 1].first <= ve[i].first);
+
+	VE x;
+	set<int> sc;
+	for(int i = ve.size() - 1; i >= 0; i--)
+	{
+		edge_descriptor e = ve[i].second;
+		double w = gr.get_edge_weight(e);
+		if(w < 1.5) break;
+		int s = e->source();
+		int t = e->target();
+		if(s == 0) continue;
+		if(t == gr.num_vertices()) continue;
+		int c1 = vv[s];
+		int c2 = vv[t];
+		assert(c1 == c2);
+		if(sc.find(c1) != sc.end()) continue;
+		x.push_back(e);
+		sc.insert(c1);
+	}
+	return x;
+}
+
+bool bundle::keep_surviving_edges()
+{
+	set<int> sv1;
+	set<int> sv2;
+	SE se;
+	edge_iterator it1, it2;
+	PEEI pei;
+	for(pei = gr.edges(), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+	{
+		int s = (*it1)->source();
+		int t = (*it1)->target();
+		double w = gr.get_edge_weight(*it1);
+		int32_t p1 = gr.get_vertex_info(s).rpos;
+		int32_t p2 = gr.get_vertex_info(t).lpos;
+		if(w < min_surviving_edge_weight) continue;
+		se.insert(*it1);
+		sv1.insert(t);
+		sv2.insert(s);
+	}
+
+	VE me = compute_maximal_edges();
+	for(int i = 0; i < me.size(); i++)
+	{
+		edge_descriptor ee = me[i];
+		se.insert(ee);
+		sv1.insert(ee->target());
+		sv2.insert(ee->source());
+	}
+
+	while(true)
+	{
+		bool b = false;
+		for(SE::iterator it = se.begin(); it != se.end(); it++)
+		{
+			edge_descriptor e = (*it);
+			int s = e->source(); 
+			int t = e->target();
+			if(sv1.find(s) == sv1.end() && s != 0)
+			{
+				edge_descriptor ee = gr.max_in_edge(s);
+				assert(ee != null_edge);
+				assert(se.find(ee) == se.end());
+				se.insert(ee);
+				sv1.insert(s);
+				sv2.insert(ee->source());
+				b = true;
+			}
+			if(sv2.find(t) == sv2.end() && t != gr.num_vertices() - 1)
+			{
+				edge_descriptor ee = gr.max_out_edge(t);
+				assert(ee != null_edge);
+				assert(se.find(ee) == se.end());
+				se.insert(ee);
+				sv1.insert(ee->target());
+				sv2.insert(t);
+				b = true;
+			}
+			if(b == true) break;
+		}
+		if(b == false) break;
+	}
+
+	VE ve;
+	for(pei = gr.edges(), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+	{
+		if(se.find(*it1) != se.end()) continue;
+		ve.push_back(*it1);
+	}
+
+	for(int i = 0; i < ve.size(); i++)
+	{
+		if(verbose >= 2) printf("remove edge (%d, %d), weight = %.2lf\n", ve[i]->source(), ve[i]->target(), gr.get_edge_weight(ve[i]));
+		gr.remove_edge(ve[i]);
+	}
+
+	if(ve.size() >= 1) return true;
+	else return false;
+}
+
+bool bundle::remove_small_exons()
+{
+	bool flag = false;
+	for(int i = 1; i < gr.num_vertices() - 1; i++)
+	{
+		vertex_info vi = gr.get_vertex_info(i);
+		if(vi.type == EMPTY_VERTEX) continue;
+
+		bool b = true;
+		edge_iterator it1, it2;
+		PEEI pei;
+		int32_t p1 = gr.get_vertex_info(i).lpos;
+		int32_t p2 = gr.get_vertex_info(i).rpos;
+
+		if(p2 - p1 >= min_exon_length) continue;
+		if(gr.degree(i) <= 0) continue;
+
+		for(pei = gr.in_edges(i), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+		{
+			edge_descriptor e = (*it1);
+			int s = e->source();
+			//if(gr.out_degree(s) <= 1) b = false;
+			if(s != 0 && gr.get_vertex_info(s).rpos == p1) b = false;
+			if(b == false) break;
+		}
+		for(pei = gr.out_edges(i), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+		{
+			edge_descriptor e = (*it1);
+			int t = e->target();
+			//if(gr.in_degree(t) <= 1) b = false;
+			if(t != gr.num_vertices() - 1 && gr.get_vertex_info(t).lpos == p2) b = false;
+			if(b == false) break;
+		}
+
+		if(b == false) continue;
+
+		// only consider boundary small exons
+		if(gr.edge(0, i).second == false && gr.edge(i, gr.num_vertices() - 1).second == false) continue;
+
+		//gr.clear_vertex(i);
+		if(verbose >= 2) printf("remove small exon: length = %d, pos = %d-%d\n", p2 - p1, p1, p2);
+		vi.type = EMPTY_VERTEX;
+		gr.set_vertex_info(i, vi);
+
+		flag = true;
+	}
+	return flag;
+}
+
+bool bundle::remove_small_junctions()
+{
+	SE se;
+	for(int i = 1; i < gr.num_vertices() - 1; i++)
+	{
+		if(gr.degree(i) <= 0) continue;
+
+		bool b = true;
+		edge_iterator it1, it2;
+		PEEI pei;
+		int32_t p1 = gr.get_vertex_info(i).lpos;
+		int32_t p2 = gr.get_vertex_info(i).rpos;
+		double wi = gr.get_vertex_weight(i);
+
+		// compute max in-adjacent edge
+		double ws = 0;
+		for(pei = gr.in_edges(i), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+		{
+			edge_descriptor e = (*it1);
+			int s = e->source();
+			double w = gr.get_vertex_weight(s);
+			if(s == 0) continue;
+			if(gr.get_vertex_info(s).rpos != p1) continue;
+			if(w < ws) continue;
+			ws = w;
+		}
+
+		// remove small in-junction
+		for(pei = gr.in_edges(i), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+		{
+			edge_descriptor e = (*it1);
+			int s = e->source();
+			double w = gr.get_edge_weight(e);
+			if(s == 0) continue;
+			if(gr.get_vertex_info(s).rpos == p1) continue;
+			if(ws < 2.0 * w * w + 18.0) continue;
+			if(wi < 2.0 * w * w + 18.0) continue;
+
+			se.insert(e);
+		}
+
+		// compute max out-adjacent edge
+		double wt = 0;
+		for(pei = gr.out_edges(i), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+		{
+			edge_descriptor e = (*it1);
+			int t = e->target();
+			double w = gr.get_vertex_weight(t);
+			if(t == gr.num_vertices() - 1) continue;
+			if(gr.get_vertex_info(t).lpos != p2) continue;
+			if(w < wt) continue;
+			wt = w;
+		}
+
+		// remove small in-junction
+		for(pei = gr.out_edges(i), it1 = pei.first, it2 = pei.second; it1 != it2; it1++)
+		{
+			edge_descriptor e = (*it1);
+			double w = gr.get_edge_weight(e);
+			int t = e->target();
+			if(t == gr.num_vertices() - 1) continue;
+			if(gr.get_vertex_info(t).lpos == p2) continue;
+			if(ws < 2.0 * w * w + 18.0) continue;
+			if(wi < 2.0 * w * w + 18.0) continue;
+
+			se.insert(e);
+		}
+
+	}
+
+	if(se.size() <= 0) return false;
+
+	for(SE::iterator it = se.begin(); it != se.end(); it++)
+	{
+		edge_descriptor e = (*it);
+		vertex_info v1 = gr.get_vertex_info(e->source());
+		vertex_info v2 = gr.get_vertex_info(e->target());
+		if(verbose >= 2) printf("remove small junction: length = %d, pos = %d-%d\n", v2.lpos - v1.rpos, v2.lpos, v1.rpos);
+		gr.remove_edge(e);
+	}
+
+	return true;
+}
+
+bool bundle::remove_inner_boundaries()
+{
+	bool flag = false;
+	int n = gr.num_vertices() - 1;
+	for(int i = 1; i < gr.num_vertices() - 1; i++)
+	{
+		vertex_info vi = gr.get_vertex_info(i);
+		if(vi.type == EMPTY_VERTEX) continue;
+
+		if(gr.in_degree(i) != 1) continue;
+		if(gr.out_degree(i) != 1) continue;
+
+		PEEI pei = gr.in_edges(i);
+		edge_iterator it1 = pei.first, it2 = pei.second;
+		edge_descriptor e1 = (*it1);
+
+		pei = gr.out_edges(i);
+		it1 = pei.first;
+		it2 = pei.second;
+		edge_descriptor e2 = (*it1);
+
+		int s = e1->source();
+		int t = e2->target();
+
+		if(s != 0 && t != n) continue;
+		if(s != 0 && gr.out_degree(s) == 1) continue;
+		if(t != n && gr.in_degree(t) == 1) continue;
+
+		if(vi.stddev >= 0.01) continue;
+
+		if(verbose >= 2) printf("remove inner boundary: vertex = %d, weight = %.2lf, length = %d, pos = %d-%d\n",
+				i, gr.get_vertex_weight(i), vi.length, vi.lpos, vi.rpos);
+
+		//gr.clear_vertex(i);
+		vi.type = EMPTY_VERTEX;
+		gr.set_vertex_info(i, vi);
+		flag = true;
+	}
+	return flag;
+}
+
+bool bundle::remove_intron_contamination()
+{
+	bool flag = false;
+	for(int i = 1; i < gr.num_vertices(); i++)
+	{
+		vertex_info vi = gr.get_vertex_info(i);
+		if(vi.type == EMPTY_VERTEX) continue;
+
+		if(gr.in_degree(i) != 1) continue;
+		if(gr.out_degree(i) != 1) continue;
+
+		edge_iterator it1, it2;
+		PEEI pei = gr.in_edges(i);
+		it1 = pei.first;
+		edge_descriptor e1 = (*it1);
+		pei = gr.out_edges(i);
+		it1 = pei.first;
+		edge_descriptor e2 = (*it1);
+		int s = e1->source();
+		int t = e2->target();
+		double wv = gr.get_vertex_weight(i);
+
+		if(s == 0) continue;
+		if(t == gr.num_vertices() - 1) continue;
+		if(gr.get_vertex_info(s).rpos != vi.lpos) continue;
+		if(gr.get_vertex_info(t).lpos != vi.rpos) continue;
+
+		PEB p = gr.edge(s, t);
+		if(p.second == false) continue;
+
+		edge_descriptor ee = p.first;
+		double we = gr.get_edge_weight(ee);
+
+		if(wv > we) continue;
+		if(wv > max_intron_contamination_coverage) continue;
+
+		if(verbose >= 2) printf("clear intron contamination %d, weight = %.2lf, length = %d, edge weight = %.2lf\n", i, wv, vi.length, we);
+
+		//gr.clear_vertex(i);
+		vi.type = EMPTY_VERTEX;
+		gr.set_vertex_info(i, vi);
+
+		flag = true;
+	}
+	return flag;
+}
+
+// add by Mingfu -- to use paired-end reads to remove false boundaries
+bool bundle::remove_false_boundaries()
+{
+	map<int, int> fb1;		// end
+	map<int, int> fb2;		// start
+	for(int i = 0; i < br.fragments.size(); i++)
+	{
+		fragment &fr = br.fragments[i];
+		if(fr.paths.size() == 1 && fr.paths[0].type == 1) continue;
+		//if(fr.h1->bridged == true || fr.h2->bridged == true) continue;
+
+		// only use uniquely aligned reads
+		//if(fr.h1->nh >= 2 || fr.h2->nh >= 2) continue;
+		if(br.breads.find(fr.h1->qname) != br.breads.end()) continue;
+
+		// calculate actual length
+		vector<int> v = align_fragment(fr);
+		
+		if(v.size() <= 1) continue;
+
+		int32_t tlen = 0;
+		int32_t offset1 = (fr.lpos - pexons[v.front()].lpos);
+		int32_t offset2 = (pexons[v.back()].rpos - fr.rpos);
+		for(int i = 0; i < v.size(); i++)
+		{
+			int32_t l = pexons[v[i]].rpos - pexons[v[i]].lpos;
+			tlen += l;
+		}
+		tlen -= offset1;
+		tlen -= offset2;
+
+		int u1 = gr.locate_vertex(fr.h1->rpos - 1);
+		int u2 = gr.locate_vertex(fr.h2->pos);
+
+		if(u1 < 0 || u2 < 0) continue;
+		if(u1 >= u2) continue;
+
+		vertex_info v1 = gr.get_vertex_info(u1);
+		vertex_info v2 = gr.get_vertex_info(u2);
+
+		int types = 0;
+		int32_t lengths = 0;
+		for(int k = 0; k < fr.paths.size(); k++) types += fr.paths[k].type;
+		for(int k = 0; k < fr.paths.size(); k++) lengths += fr.paths[k].length;
+
+		bool use = true;
+		if(fr.paths.size() == 1 && types == 2 && tlen > 10000) use = false;
+		//if(fr.paths.size() == 1 && types == 2 && lengths <= 1.5 * insertsize_high) use = false;
+		//if(fr.paths.size() == 1 && types == 2 && tlen <= 1.5 * insertsize_high) use = false;
+		//if(fr.paths.size() == 1 && types == 2 && lengths <= 2 * tlen) use = false;
+
+		if(verbose >= 2) printf("%s: u1 = %d, %d-%d, u2 = %d, %d-%d, h1.rpos = %d, h2.lpos = %d, #bridging = %lu, types = %d, lengths = %d, tlen = %d, use = %c\n", 
+				fr.h1->qname.c_str(), u1, v1.lpos, v1.rpos, u2, v2.lpos, v2.rpos, fr.h1->rpos, fr.h2->pos, fr.paths.size(), types, lengths, tlen, use ? 'T' : 'F');
+
+		if(use == false) continue;
+
+		//if(gr.get_vertex_info(u1).rpos == fr.h1->rpos)
+		{
+			if(fb1.find(u1) != fb1.end()) fb1[u1]++;
+			else fb1.insert(make_pair(u1, 1));
+		}
+
+		//if(gr.get_vertex_info(u2).lpos == fr.h2->pos)
+		{
+			if(fb2.find(u2) != fb2.end()) fb2[u2]++;
+			else fb2.insert(make_pair(u2, 1));
+		}
+	}
+
+	bool b = false;
+	for(auto &x : fb1)
+	{
+		PEB p = gr.edge(x.first, gr.num_vertices() - 1);
+		vertex_info vi = gr.get_vertex_info(x.first);
+		if(vi.type == EMPTY_VERTEX) continue;
+		if(p.second == false) continue;
+		double w = gr.get_vertex_weight(x.first);
+		double z = log(1 + w) / log(1 + x.second);
+		double s = log(1 + w) - log(1 + x.second);
+		if(s > 1.5) continue;
+		if(verbose >= 2) printf("detect false end boundary %d with %d reads, vertex = %d, w = %.2lf, type = %d, z = %.2lf, s = %.2lf\n", vi.rpos, x.second, x.first, w, vi.type, z, s); 
+		//gr.remove_edge(p.first);
+		vi.type = EMPTY_VERTEX;
+		gr.set_vertex_info(x.first, vi);
+		b = true;
+	}
+
+	for(auto &x : fb2)
+	{
+		PEB p = gr.edge(0, x.first);
+		vertex_info vi = gr.get_vertex_info(x.first);
+		if(vi.type == EMPTY_VERTEX) continue;
+		if(p.second == false) continue;
+		double w = gr.get_vertex_weight(x.first);
+		double z = log(1 + w) / log(1 + x.second);
+		double s = log(1 + w) - log(1 + x.second);
+		if(s > 1.5) continue;
+		if(verbose >= 2) printf("detect false start boundary %d with %d reads, vertex = %d, w = %.2lf, type = %d, z = %.2lf, s = %.2lf\n", vi.lpos, x.second, x.first, w, vi.type, z, s); 
+		//gr.remove_edge(p.first);
+		vi.type = EMPTY_VERTEX;
+		gr.set_vertex_info(x.first, vi);
+		b = true;
+	}
+	return b;
+}
+
+bool bundle::tackle_false_boundaries()
+{
+	bool b = false;
+	vector<int> points(pexons.size(), 0);
+	for(int k = 0; k < br.fragments.size(); k++)
+	{
+		fragment &fr = br.fragments[k];
+
+		if(fr.paths.size() != 1) continue;
+		if(fr.paths[0].type != 2) continue;
+		if(br.breads.find(fr.h1->qname) != br.breads.end()) continue;
+
+		vector<int> v = align_fragment(fr);
+		if(v.size() <= 1) continue;
+
+		int32_t offset1 = (fr.lpos - pexons[v.front()].lpos);
+		int32_t offset2 = (pexons[v.back()].rpos - fr.rpos);
+
+		int32_t tlen = 0;
+		for(int i = 0; i < v.size(); i++)
+		{
+			int32_t l = pexons[v[i]].rpos - pexons[v[i]].lpos;
+			tlen += l;
+		}
+		tlen -= offset1;
+		tlen -= offset2;
+
+		// print
+		//fr.print(99);
+		if(verbose >= 2) printf("break fragment %s: total-length = %d, bridge-length = %d\n", fr.h1->qname.c_str(), tlen, fr.paths[0].length);
+		/*
+		for(int i = 0; i < v.size(); i++)
+		{
+			int32_t l = pexons[v[i]].rpos - pexons[v[i]].lpos;
+			if(i == 0) l -= offset1;
+			if(i == v.size() - 1) l -= offset2;
+			printf(" vertex %d: length = %d, region = %d-%d -> %d\n", v[i], l, pexons[v[i]].lpos, pexons[v[i]].rpos, pexons[v[i]].rpos - pexons[v[i]].lpos);
+		}
+		*/
+
+		if(tlen < insertsize_low / 2.0) continue;
+		if(tlen > insertsize_high * 2.0) continue;
+		if(tlen >= fr.paths[0].length) continue;
+
+		for(int i = 0; i < v.size() - 1; i++)
+		{
+			partial_exon &px = pexons[v[i + 0]];
+			partial_exon &py = pexons[v[i + 1]];
+			if(px.rtype == END_BOUNDARY) 
+			{
+				if(verbose >= 2) printf("break ending vertex %d, pos = %d\n", v[i], px.rpos);
+				points[v[i + 0]] += 1;
+			}
+			if(py.ltype == START_BOUNDARY) 
+			{
+				if(verbose >= 2) printf("break starting vertex %d, pos = %d\n", v[i + 1], py.lpos);
+				points[v[i + 1]] += 1;
+			}
+		}
+	}
+
+	for(int k = 0; k < points.size(); k++)
+	{
+		if(points[k] <= 0) continue;
+		vertex_info vi = gr.get_vertex_info(k + 1);
+		if(vi.type == EMPTY_VERTEX) continue;
+		PEB p = gr.edge(k + 1, gr.num_vertices() - 1);
+		if(p.second == false) continue;
+		double w = gr.get_vertex_weight(k + 1);
+		double z = log(1 + w) / log(1 + points[k]);
+		double s = log(1 + w) - log(1 + points[k]);
+		if(verbose >= 2) printf("tackle false end boundary %d with %d reads, vertex = %d, w = %.2lf, z = %.2lf, s = %.2lf\n", pexons[k].rpos, points[k], k + 1, w, z, s);
+		if(s > 1.5) continue;
+		vi.type = EMPTY_VERTEX;
+		gr.set_vertex_info(k + 1, vi);
+		b = true;
+	}
+
+	for(int k = 0; k < points.size(); k++)
+	{
+		if(points[k] <= 0) continue;
+		vertex_info vi = gr.get_vertex_info(k + 1);
+		if(vi.type == EMPTY_VERTEX) continue;
+		PEB p = gr.edge(0, k + 1);
+		if(p.second == false) continue;
+		double w = gr.get_vertex_weight(k + 1);
+		double z = log(1 + w) / log(1 + points[k]);
+		double s = log(1 + w) - log(1 + points[k]);
+		if(verbose >= 2) printf("tackle false start boundary %d with %d reads, vertex = %d, w = %.2lf, z = %.2lf, s = %.2lf\n", pexons[k].lpos, points[k], k + 1, w, z, s);
+		if(s > 1.5) continue;
+		vi.type = EMPTY_VERTEX;
+		gr.set_vertex_info(k + 1, vi);
+		b = true;
+	}
+
+	return b;
+}
+
+int bundle::build_hyper_set()
+{
+	map<vector<int>, int> m;
+
+	for(int k = 0; k < br.fragments.size(); k++)
+	{
+		fragment &fr = br.fragments[k];
+
+		if(fr.type != 0) continue;	// note by Qimin, skip if not paired-end fragments
+
+		if(fr.h1->paired != true) printf("error type: %d\n", fr.type);
+		assert(fr.h1->paired == true);
+		assert(fr.h2->paired == true);
+
+		if(fr.paths.size() != 1) continue;
+		if(fr.paths[0].type != 1) continue;
+
+		//if(fr.h1->bridged == false) continue;
+		//if(fr.h2->bridged == false) continue;
+
+		vector<int> v = align_fragment(fr);
+		
+		if(m.find(v) == m.end()) m.insert(pair<vector<int>, int>(v, fr.cnt));
+		else m[v] += fr.cnt;
+	}
+
+	
+	// note by Qimin, bridge umi-linked fragments into one single long path
+	for(int k = 0; k < br.umiLink.size(); k++)
+	{
+		vector<int> v;
+		v.clear();
+
+		int cnt = 0;
+
+		// if only one fr, no need to bridge into longer one
+		if(br.umiLink[k].size() == 1)
+		{
+			fragment &fr = br.fragments[(br.umiLink[k][0])];
+
+			if(fr.paths.size() != 1) continue;
+
+			// TODO: "bridged" may not be correct
+			if(fr.h1->bridged == false) continue;
+			if(fr.h2->bridged == false) continue;
+
+			v = align_fragment(fr);
+			if(fr.paths.size() != 1 || fr.paths[0].type != 1) v.clear();
+
+			if(m.find(v) == m.end()) m.insert(pair<vector<int>, int>(v, fr.cnt));
+			else m[v] += fr.cnt;
+
+			continue;
+		}
+
+		// if multiple fr in umi-link, bridge into one single long path
+		for(int kk = 0; kk < br.umiLink[k].size(); kk++)
+		{
+			fragment &fr = br.fragments[(br.umiLink[k][kk])];
+
+			// if unbridge, then trucate and add to m
+			if(fr.paths.size() != 1 || fr.h1->bridged == false || fr.h2->bridged == false)
+			{
+				if(v.size() > 0)
+				{
+					if(m.find(v) == m.end()) m.insert(pair<vector<int>, int>(v, cnt));
+					else m[v] += cnt;
+				}
+
+				v.clear();
+				cnt = 0;
+
+				continue;
+			}
+
+			// otherwise, add and merge cur_v to v
+			vector<int> cur_v = align_fragment(fr);
+			if(fr.paths.size() != 1 || fr.paths[0].type != 1) cur_v.clear();
+
+			if(cur_v.size()==0)
+			{
+				if(v.size() > 0)
+				{
+					if(m.find(v) == m.end()) m.insert(pair<vector<int>, int>(v, cnt));
+					else m[v] += cnt;
+				}
+
+				v.clear();
+				cnt = 0;
+
+				continue;
+
+			}
+			cnt += fr.cnt;
+
+			v.insert(v.end(), cur_v.begin(), cur_v.end());
+			sort(v.begin(), v.end());
+			vector<int>::iterator iter = unique(v.begin(),v.end());
+			v.erase(iter,v.end());
+		}
+
+		if(v.size() > 0)
+		{
+			/*
+			printf("v = ");
+			for(int ii = 0; ii < v.size(); ii++)
+			{
+				printf("%d ", v[ii]);
+			}
+			printf("\n");
+			*/
+
+			if(m.find(v) == m.end()) m.insert(pair<vector<int>, int>(v, cnt));
+			else m[v] += cnt;
+		}
+	}
+	
+	for(int k = 0; k < bb.hits.size(); k++)
+	{
+		hit &h = bb.hits[k];
+
+		// bridged used here, but maybe okay
+		if(h.bridged == true) continue;
+
+		vector<int> v = align_hit(h);
+		
+		if(m.find(v) == m.end()) m.insert(pair<vector<int>, int>(v, 1));
+		else m[v] += 1;
+	}
+
+	hs.clear();
+	for(map<vector<int>, int>::iterator it = m.begin(); it != m.end(); it++)
+	{
+		const vector<int> &v = it->first;
+		int c = it->second;
+		if(v.size() >= 2) hs.add_node_list(v, c);
+	}
+	return 0;
+}
