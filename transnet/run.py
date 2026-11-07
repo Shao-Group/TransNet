@@ -141,7 +141,11 @@ def transcript_table(item, scores):
         if item["truth"] is not None:
             row["label"] = int(gtf.chain_key(r) in item["truth"])
         rows.append(row)
-    return pd.DataFrame(rows)
+    columns = ["transcript_id", "chr", "strand", "start", "end", "exons",
+               "native_abundance", "score", "status"]
+    if item["truth"] is not None:
+        columns.append("label")
+    return pd.DataFrame(rows, columns=columns)
 
 
 def save_model(path, model, fit, reads, metadata):

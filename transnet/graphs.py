@@ -173,6 +173,8 @@ def load_quality(path):
             values = [float(row[f]) for f in QUALITY_FIELDS]
             if not np.isfinite(values).all() or min(values) < 0:
                 raise ValueError(f"Invalid junction quality: {key}")
+            if key in rows:
+                raise ValueError(f"Duplicate junction quality identity: {key}")
             rows[key] = values
     return rows
 
@@ -200,6 +202,13 @@ def build_graphs(folder, records, truth, max_nodes=10000, threads=4):
         for gid, part in frame.groupby("graph_id", sort=False):
             if part["chr"].nunique() != 1 or part["sample"].nunique() != 1:
                 raise ValueError(f"graph_id {gid} spans chromosomes or samples")
+    identities = {}
+    for frame in tables:
+        for gid, part in frame.groupby("graph_id", sort=False):
+            identity = (str(part["chr"].iloc[0]), str(part["sample"].iloc[0]))
+            if gid in identities and identities[gid] != identity:
+                raise ValueError(f"graph_id {gid} changes chromosome/sample across feature tables")
+            identities[gid] = identity
     grouped = [{gid: f for gid, f in t.groupby("graph_id", sort=False)} for t in tables]
     if set(grouped[2]) - set(grouped[0]):
         raise ValueError("Path table contains graphs absent from the node table")

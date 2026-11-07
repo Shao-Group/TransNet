@@ -25,9 +25,12 @@ def chromosome_list(value):
 
 
 def insert_size(value):
-    parts = [int(v) for v in value.split(",")]
-    if len(parts) != 3 or not parts[1] <= parts[0] <= parts[2]:
-        raise argparse.ArgumentTypeError("expected MEDIAN,LOW,HIGH with LOW <= MEDIAN <= HIGH")
+    try:
+        parts = [int(v) for v in value.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("insert sizes must be integers") from exc
+    if len(parts) != 3 or not 0 < parts[1] <= parts[0] <= parts[2]:
+        raise argparse.ArgumentTypeError("expected MEDIAN,LOW,HIGH with 0 < LOW <= MEDIAN <= HIGH")
     return parts
 
 
@@ -106,9 +109,20 @@ def parser():
 
 
 def setup(args):
+    for name in ("threads", "batch_size", "pair_budget", "updates", "validate_every"):
+        if hasattr(args, name) and getattr(args, name) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if args.max_nodes < 0:
+        raise ValueError("--max-nodes must be nonnegative")
+    if hasattr(args, "lr"):
+        import math
+        if not math.isfinite(args.lr) or args.lr <= 0:
+            raise ValueError("--lr must be finite and positive")
+        if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+            raise ValueError("--weight-decay must be finite and nonnegative")
     out = Path(args.out)
-    if (out / "transnet.log").exists():
-        raise SystemExit(f"{out} already contains a TransNet run; choose a new --out")
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"{out} is not empty; choose a new --out to preserve existing files")
     out.mkdir(parents=True, exist_ok=True)
     args.work = str(out / "work")
     handlers = [logging.FileHandler(out / "transnet.log"), logging.StreamHandler(sys.stderr)]

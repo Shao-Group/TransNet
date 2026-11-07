@@ -25,7 +25,7 @@ def evaluate(tables, destination, title):
     for k, (name, t) in enumerate(tables.items()):
         color = COLORS[k % len(COLORS)]
         for column, method, style in (("score", "TransNet", "-"), ("native_abundance", "native abundance", ":")):
-            both = t.label.nunique() == 2
+            both = len(t) > 0 and bool(t.label.sum() > 0)
             ap = float(average_precision_score(t.label, t[column])) if both else float("nan")
             rows.append(dict(gtf=name, ranking=method, average_precision=ap,
                              candidates=len(t), positives=int(t.label.sum())))
@@ -35,7 +35,8 @@ def evaluate(tables, destination, title):
     ax.set(xlabel="Recall", ylabel="Precision", title=title, xlim=(0, 1), ylim=(0, 1.02))
     ax.set_box_aspect(1)
     ax.grid(alpha=0.2)
-    ax.legend(loc="lower left", fontsize=7)
+    if ax.lines:
+        ax.legend(loc="lower left", fontsize=7)
     fig.tight_layout()
     fig.savefig(destination / "pr_curves.pdf")
     plt.close(fig)

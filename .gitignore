@@ -1,4 +1,10 @@
 bin/
 __pycache__/
 *.egg-info/
-dev/
+dev/*
+!dev/DEVELOPMENT_NOTES.md
+!dev/RELEASE_REVIEW.md
+!dev/*.py
+!dev/*.sh
+build/
+dist/

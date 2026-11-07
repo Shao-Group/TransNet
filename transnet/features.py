@@ -16,6 +16,7 @@ quality fields for every splice edge (``quality.csv``).
 from collections import Counter
 import csv
 import logging
+import os
 from pathlib import Path
 import re
 import shutil
@@ -44,9 +45,18 @@ def samtools():
 
 
 def exporter():
-    path = PACKAGE / "bin" / "transnet-exporter"
-    if not path.exists():
-        raise RuntimeError(f"{path} is missing; build it once with: bash exporter/build.sh")
+    override = os.environ.get("TRANSNET_EXPORTER")
+    path = Path(override) if override else PACKAGE / "bin" / "transnet-exporter"
+    if not override and not path.is_file():
+        installed = shutil.which("transnet-exporter")
+        if installed:
+            path = Path(installed)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise RuntimeError(
+            f"Exporter {path} is missing or not executable; build it with bash exporter/build.sh "
+            "in the source checkout, then set TRANSNET_EXPORTER to its absolute path "
+            "when using a non-editable installation"
+        )
     return path
 
 
@@ -61,6 +71,8 @@ def bam_chromosomes(bam):
 
 def filter_bam(bam, chromosomes, work, threads, logfile):
     """Primary, mapped alignments (-F 2308) on the requested chromosomes, indexed."""
+    if not chromosomes:
+        raise ValueError("No chromosomes selected; check BAM/GTF chromosome names")
     references = bam_chromosomes(bam)
     missing = set(chromosomes) - set(references)
     if missing:

@@ -153,6 +153,9 @@ def add_isoquant_cov(gtf_path, tpm_path, output):
     The pretrained long-read models were trained with IsoQuant TPM as the
     native abundance of IsoQuant candidates.
     """
+    output = Path(output)
+    if output.resolve() in (Path(gtf_path).resolve(), Path(tpm_path).resolve()):
+        raise ValueError("Refusing to overwrite an IsoQuant input file")
     abundance = {}
     for line in Path(tpm_path).read_text().splitlines():
         if line.startswith("#") or not line.strip():
@@ -166,14 +169,20 @@ def add_isoquant_cov(gtf_path, tpm_path, output):
         if parts[0] in abundance or not math.isfinite(value) or value < 0:
             raise ValueError("Duplicate or invalid TPM for " + parts[0])
         abundance[parts[0]] = value
-    with _open(gtf_path) as src, open(output, "w") as dst:
-        for line in src:
-            f = line.rstrip("\n").split("\t")
-            if line.startswith("#") or len(f) != 9 or f[2] != "transcript":
-                dst.write(line)
-                continue
-            match = re.search(r'transcript_id "([^"]+)"', f[8])
-            if not match or match[1] not in abundance:
-                raise ValueError("No TPM for IsoQuant transcript " + (match[1] if match else "?"))
-            f[8] = re.sub(r'\bcov\s+"[^"]*"\s*;?', "", f[8]).rstrip() + ' cov "' + str(abundance[match[1]]) + '";'
-            dst.write("\t".join(f) + "\n")
+    fd, temporary = tempfile.mkstemp(dir=output.parent, prefix=output.name + ".")
+    try:
+        with _open(gtf_path) as src, os.fdopen(fd, "w") as dst:
+            for line in src:
+                f = line.rstrip("\n").split("\t")
+                if line.startswith("#") or len(f) != 9 or f[2] != "transcript":
+                    dst.write(line)
+                    continue
+                match = re.search(r'transcript_id "([^"]+)"', f[8])
+                if not match or match[1] not in abundance:
+                    raise ValueError("No TPM for IsoQuant transcript " + (match[1] if match else "?"))
+                f[8] = re.sub(r'\bcov\s+"[^"]*"\s*;?', "", f[8]).rstrip() + ' cov "' + str(abundance[match[1]]) + '";'
+                dst.write("\t".join(f) + "\n")
+        os.replace(temporary, output)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
